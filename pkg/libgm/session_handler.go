@@ -24,6 +24,7 @@ type SessionHandler struct {
 	ackMapLock sync.Mutex
 	ackMap     []string
 	ackTicker  *time.Ticker
+	ackStop    chan struct{}
 
 	sessionID string
 }
@@ -270,12 +271,30 @@ func (s *SessionHandler) startAckInterval() {
 		return
 	}
 	ticker := time.NewTicker(5 * time.Second)
+	stop := make(chan struct{})
 	s.ackTicker = ticker
+	s.ackStop = stop
 	go func() {
-		for range ticker.C {
-			s.sendAckRequest()
+		for {
+			select {
+			case <-ticker.C:
+				s.sendAckRequest()
+			case <-stop:
+				return
+			}
 		}
 	}()
+}
+
+func (s *SessionHandler) stopAckInterval() {
+	if s.ackTicker != nil {
+		s.ackTicker.Stop()
+		s.ackTicker = nil
+	}
+	if s.ackStop != nil {
+		close(s.ackStop)
+		s.ackStop = nil
+	}
 }
 
 func (s *SessionHandler) sendAckRequest() {
