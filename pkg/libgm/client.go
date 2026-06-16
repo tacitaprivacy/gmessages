@@ -290,6 +290,7 @@ func (c *Client) postConnect() {
 }
 
 func (c *Client) Disconnect() {
+	c.sessionHandler.stopAckInterval()
 	c.closeLongPolling()
 	c.http.CloseIdleConnections()
 }
