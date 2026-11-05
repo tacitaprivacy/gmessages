@@ -2,6 +2,7 @@ package libgm
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -29,6 +30,15 @@ type SessionHandler struct {
 	sessionID string
 }
 
+// ErrPhoneNotResponding is returned when the phone doesn't answer a request
+// within responseHardTimeout. A phone that was unpaired, or is off, never
+// answers; with a Google account session the web session stays valid, so
+// without this bound the caller would wait forever.
+var ErrPhoneNotResponding = errors.New("phone did not respond")
+
+// responseHardTimeout is how long to wait for the phone to answer a request.
+const responseHardTimeout = 60 * time.Second
+
 func (s *SessionHandler) ResetSessionID() {
 	s.sessionID = uuid.NewString()
 }
@@ -54,9 +64,14 @@ func (s *SessionHandler) sendMessageNoResponse(params SendMessageParams) error {
 }
 
 func (s *SessionHandler) sendAsyncMessage(params SendMessageParams) (<-chan *IncomingRPCMessage, error) {
+	ch, _, err := s.sendAsyncMessageWithID(params)
+	return ch, err
+}
+
+func (s *SessionHandler) sendAsyncMessageWithID(params SendMessageParams) (chan *IncomingRPCMessage, string, error) {
 	requestID, payload, err := s.buildMessage(params)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	ch := s.waitResponse(requestID)
@@ -73,9 +88,9 @@ func (s *SessionHandler) sendAsyncMessage(params SendMessageParams) (<-chan *Inc
 	)
 	if err != nil {
 		s.cancelResponse(requestID, ch)
-		return nil, err
+		return nil, "", err
 	}
-	return ch, nil
+	return ch, requestID, nil
 }
 
 func typedResponse[T proto.Message](resp *IncomingRPCMessage, err error) (casted T, retErr error) {
@@ -101,9 +116,13 @@ func (s *SessionHandler) waitResponse(requestID string) chan *IncomingRPCMessage
 
 func (s *SessionHandler) cancelResponse(requestID string, ch chan *IncomingRPCMessage) {
 	s.responseWaitersLock.Lock()
-	close(ch)
-	delete(s.responseWaiters, requestID)
-	s.responseWaitersLock.Unlock()
+	defer s.responseWaitersLock.Unlock()
+	// receiveResponse removes the waiter before sending on ch; if it already
+	// did, leave ch open so that send (into the 1-slot buffer) can't panic.
+	if _, ok := s.responseWaiters[requestID]; ok {
+		delete(s.responseWaiters, requestID)
+		close(ch)
+	}
 }
 
 func (s *SessionHandler) receiveResponse(msg *IncomingRPCMessage) bool {
@@ -150,11 +169,13 @@ func (s *SessionHandler) receiveResponse(msg *IncomingRPCMessage) bool {
 }
 
 func (s *SessionHandler) sendMessageWithParams(params SendMessageParams) (*IncomingRPCMessage, error) {
-	ch, err := s.sendAsyncMessage(params)
+	ch, requestID, err := s.sendAsyncMessageWithID(params)
 	if err != nil {
 		return nil, err
 	}
 
+	hardTimer := time.NewTimer(responseHardTimeout)
+	defer hardTimer.Stop()
 	select {
 	case resp := <-ch:
 		return resp, nil
@@ -165,8 +186,13 @@ func (s *SessionHandler) sendMessageWithParams(params SendMessageParams) (*Incom
 		default:
 		}
 	}
-	// TODO hard timeout?
-	return <-ch, nil
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-hardTimer.C:
+		s.cancelResponse(requestID, ch)
+		return nil, fmt.Errorf("%w in %s", ErrPhoneNotResponding, responseHardTimeout)
+	}
 }
 
 func (s *SessionHandler) sendMessage(actionType gmproto.ActionType, encryptedData proto.Message) (*IncomingRPCMessage, error) {
